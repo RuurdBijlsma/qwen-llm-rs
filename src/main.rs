@@ -204,7 +204,7 @@ fn main() -> Result<()> {
     session.reset();
     info!("Torus: {}", session.chat(prompt, &[img_torus])?);
     session.reset();
-    info!("Hike 2: {}", session.chat(prompt, &[img_island])?);
+    info!("Island again: {}", session.chat(prompt, &[img_island])?);
     info!(
         "Follow up: {}",
         session.chat("Where might this be?", &[] as &[&str])?

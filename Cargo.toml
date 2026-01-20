@@ -1,14 +1,12 @@
 [package]
-name = "rs-multimodal-llm"
+name = "qwen-llm-rs"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 llama-cpp-2 = { path = "../llama-cpp-rs/llama-cpp-2", features = ["mtmd", "cuda"] }
 llama-cpp-sys-2 = { path = "../llama-cpp-rs/llama-cpp-sys-2" }
-clap = { version = "4.4", features = ["derive"] }
 tracing = "0.1.44"
-log = "0.4.29"
 color-eyre = "0.6.5"
 tracing-subscriber = {version = "0.3.22", features = ["env-filter"]}
 gag = "1.0.0"
