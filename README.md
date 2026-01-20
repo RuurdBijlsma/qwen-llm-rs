@@ -34,16 +34,16 @@ This is a Rust implementation for running Qwen3-VL models using llama.cpp bindin
     You can update these filenames in `src/main.rs`.
 
 3.  Run the project:
-
-```bash
-cargo run --release
-```
+    ```bash
+    cargo run --release
+    ```
 
 ## Usage Example
 
 ```rust
 use qwen_llm_rs::MultimodalModel;
 use std::path::Path;
+use std::io::{self, Write};
 
 fn main() -> color_eyre::Result<()> {
     let model_manager = MultimodalModel::load()?;
@@ -57,6 +57,12 @@ fn main() -> color_eyre::Result<()> {
 
     let follow_up = session.chat("Can you describe the colors?", &[] as &[&str])?;
     println!("Model: {}", follow_up);
+
+    // Or stream the response token by token
+    for token in session.stream_chat("Describe the scene.", &[] as &[&str])? {
+        print!("{}", token?);
+        io::stdout().flush()?;
+    }
 
     Ok(())
 }

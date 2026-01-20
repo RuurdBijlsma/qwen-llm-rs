@@ -12,6 +12,8 @@ use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputTex
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::{mtmd, send_logs_to_tracing, LogOptions};
 use std::ffi::CString;
+use std::io;
+use std::io::Write;
 use std::num::NonZeroU32;
 use std::path::Path;
 use tracing::info;
@@ -209,6 +211,11 @@ fn main() -> Result<()> {
         "Follow up: {}",
         session.chat("Where might this be?", &[] as &[&str])?
     );
+
+    for token in session.stream_chat("Describe the scene.", &[] as &[&str])? {
+        print!("{}", token?);
+        io::stdout().flush()?;
+    }
 
     Ok(())
 }
