@@ -33,6 +33,12 @@ This is a Rust implementation for running Qwen3-VL models using llama.cpp bindin
 
     You can update these filenames in `src/main.rs`.
 
+3.  Run the project:
+
+```bash
+cargo run --release
+```
+
 ## Usage Example
 
 ```rust
