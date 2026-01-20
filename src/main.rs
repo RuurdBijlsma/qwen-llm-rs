@@ -193,18 +193,18 @@ fn main() -> Result<()> {
     let model_manager = MultimodalModel::load()?;
     let mut session = model_manager.new_session()?;
 
-    let img_hike = Path::new("assets/img/hike.png");
+    let img_island = Path::new("assets/img/island.png");
     let img_farm = Path::new("assets/img/farm.png");
     let img_torus = Path::new("assets/img/torus.png");
     let prompt = "Caption this image in one paragraph. Respond with the caption only.";
 
-    info!("Hike: {}", session.chat(prompt, &[img_hike])?);
+    info!("Island: {}", session.chat(prompt, &[img_island])?);
     session.reset();
     info!("Farm: {}", session.chat(prompt, &[img_farm])?);
     session.reset();
     info!("Torus: {}", session.chat(prompt, &[img_torus])?);
     session.reset();
-    info!("Hike 2: {}", session.chat(prompt, &[img_hike])?);
+    info!("Hike 2: {}", session.chat(prompt, &[img_island])?);
     info!(
         "Follow up: {}",
         session.chat("Where might this be?", &[] as &[&str])?
