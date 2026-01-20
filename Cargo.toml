@@ -7,7 +7,6 @@ edition = "2021"
 llama-cpp-2 = { path = "../llama-cpp-rs/llama-cpp-2", features = ["mtmd", "cuda"] }
 llama-cpp-sys-2 = { path = "../llama-cpp-rs/llama-cpp-sys-2" }
 clap = { version = "4.4", features = ["derive"] }
-image = "0.25.9"
 tracing = "0.1.44"
 log = "0.4.29"
 color-eyre = "0.6.5"

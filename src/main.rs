@@ -15,12 +15,38 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::{send_logs_to_tracing, LogOptions};
 use log::info;
 use std::ffi::CString;
-use std::io::Write; // Import Write for flush()
 use std::num::NonZeroU32;
 use std::path::Path;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
+
+pub struct MultimodalModel {
+    backend: LlamaBackend,
+    model: LlamaModel,
+}
+
+impl MultimodalModel {
+    pub fn load(model_path: &str, n_gpu_layers: i32) -> Result<Self> {
+        let _gag_out = Gag::stdout().map_err(|_| eyre!("Unable to gag stdout"))?;
+        let _gag_err = Gag::stderr().map_err(|_| eyre!("Unable to gag stderr"))?;
+
+        let backend = LlamaBackend::init().context("Failed to init backend")?;
+        send_logs_to_tracing(LogOptions::default().with_logs_enabled(false));
+
+        let model_params = LlamaModelParams::default()
+            .with_n_gpu_layers(n_gpu_layers.try_into().unwrap_or(0));
+
+        let model = LlamaModel::load_from_file(&backend, model_path, &model_params)
+            .context("Failed to load model")?;
+
+        Ok(Self { backend, model })
+    }
+
+    pub fn new_session(&self, mmproj_path: &str, ctx_size: u32) -> Result<MultimodalSession> {
+        MultimodalSession::new(&self.backend, &self.model, mmproj_path, ctx_size)
+    }
+}
 
 pub struct MultimodalSession<'a> {
     model: &'a LlamaModel,
@@ -31,16 +57,12 @@ pub struct MultimodalSession<'a> {
 }
 
 impl<'a> MultimodalSession<'a> {
-    pub fn new(
+    fn new(
         backend: &'a LlamaBackend,
         model: &'a LlamaModel,
         mmproj_path: &str,
         ctx_size: u32,
     ) -> Result<Self> {
-        // NOTE: We do NOT gag here. We rely on the caller (main) to handle global silencing.
-        // Nesting gags can cause premature stream restoration.
-
-        // Create Context
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(ctx_size))
             .with_flash_attention_policy(llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED)
@@ -52,7 +74,6 @@ impl<'a> MultimodalSession<'a> {
             .new_context(backend, ctx_params)
             .context("Failed to create context")?;
 
-        // Init MTMD Context
         let mtmd_params = MtmdContextParams {
             use_gpu: true,
             print_timings: false,
@@ -60,7 +81,6 @@ impl<'a> MultimodalSession<'a> {
             media_marker: CString::new(llama_cpp_2::mtmd::mtmd_default_marker().to_string())?,
         };
 
-        // This function call is the source of the "clip_model_loader" spam
         let mtmd_ctx = MtmdContext::init_from_file(mmproj_path, model, &mtmd_params)
             .context("Failed to initialize MTMD context")?;
 
@@ -73,7 +93,6 @@ impl<'a> MultimodalSession<'a> {
         })
     }
 
-    /// Resets the context (clears KV cache).
     pub fn reset(&mut self) {
         self.context.clear_kv_cache();
         self.n_past = 0;
@@ -85,14 +104,8 @@ impl<'a> MultimodalSession<'a> {
 
         for token_res in stream {
             match token_res {
-                Ok(token) => {
-                    result.push_str(&token);
-                }
-                Err(e) => {
-                    return Err(e.wrap_err(format!(
-                        "Error generating token, result until now: \n{result}\n\n"
-                    )));
-                }
+                Ok(token) => result.push_str(&token),
+                Err(e) => return Err(e.wrap_err(format!("Error during generation: {result}"))),
             }
         }
         Ok(result)
@@ -103,45 +116,21 @@ impl<'a> MultimodalSession<'a> {
         prompt: &str,
         image_paths: &[P],
     ) -> Result<ResponseStream<'a, '_>> {
-        // Local silence for the chat processing loop (image encoding logs)
-        let _gag_out;
-        let _gag_err;
-
-        {
-            // Flush before gagging to prevent losing pending Rust logs
-            let _ = std::io::stdout().flush();
-            let _ = std::io::stderr().flush();
-
-            // Gag both. Using .ok() here is safer for the loop, but in main we strictly check.
-            _gag_out = Gag::stdout().ok();
-            _gag_err = Gag::stderr().ok();
-        }
-
-        // 1. Load Images
         let mut bitmaps = Vec::new();
-        let loaded_bitmaps: Vec<MtmdBitmap> = image_paths
-            .iter()
-            .map(|p| {
-                let path_str = p
-                    .as_ref()
-                    .to_str()
-                    .ok_or_else(|| eyre!("Invalid path string"))?;
-                MtmdBitmap::from_file(&self.mtmd_ctx, path_str)
-                    .context(format!("Failed to load image: {}", path_str))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        bitmaps.extend(loaded_bitmaps.iter());
+        for p in image_paths {
+            let path_str = p.as_ref().to_str().ok_or_else(|| eyre!("Invalid path"))?;
+            bitmaps.push(MtmdBitmap::from_file(&self.mtmd_ctx, path_str)?);
+        }
 
         let default_marker = llama_cpp_2::mtmd::mtmd_default_marker().to_string();
         let mut full_prompt = prompt.to_string();
         if !bitmaps.is_empty() && !full_prompt.contains(&default_marker) {
             full_prompt = format!("{} {}", default_marker, full_prompt);
         }
+
         let messages = vec![LlamaChatMessage::new("user".to_string(), full_prompt)?];
         let chat_template = self.model.chat_template(None)?;
-        let formatted_prompt =
-            self.model
-                .apply_chat_template(&chat_template, &messages, true)?;
+        let formatted_prompt = self.model.apply_chat_template(&chat_template, &messages, true)?;
 
         let input_text = MtmdInputText {
             text: formatted_prompt,
@@ -149,32 +138,23 @@ impl<'a> MultimodalSession<'a> {
             parse_special: true,
         };
 
-        let chunks = self
-            .mtmd_ctx
-            .tokenize(input_text, &bitmaps)
-            .context("Failed to tokenize")?;
+        // FIX: tokenize expects a slice of references (&[&MtmdBitmap])
+        let bitmap_refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
+        let chunks = self.mtmd_ctx.tokenize(input_text, &bitmap_refs)?;
 
-        self.n_past = chunks
-            .eval_chunks(
-                &self.mtmd_ctx,
-                &mut self.context,
-                self.n_past as i32,
-                0,
-                4096,
-                true,
-            )
-            .context("Failed to evaluate")? as usize;
-
-        // Gags will drop automatically when `_gag_out`/`_gag_err` go out of scope at end of function
-        // Wait, we need to return the stream. We drop them *now* before returning.
-        drop(_gag_out);
-        drop(_gag_err);
+        self.n_past = chunks.eval_chunks(
+            &self.mtmd_ctx,
+            &mut self.context,
+            self.n_past as i32,
+            0,
+            4096,
+            true,
+        )? as usize;
 
         let sampler = LlamaSampler::chain_simple([
             LlamaSampler::penalties(-1, 1.0, 0.0, 1.5),
             LlamaSampler::top_p(0.8, 1),
             LlamaSampler::temp(0.7),
-            LlamaSampler::min_p(0.0, 1),
             LlamaSampler::greedy(),
         ]);
 
@@ -204,9 +184,7 @@ impl<'a, 'b> Iterator for ResponseStream<'a, 'b> {
     type Item = Result<String>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.is_done {
-            return None;
-        }
+        if self.is_done { return None; }
 
         let token = self.sampler.sample(self.context, -1);
         self.sampler.accept(token);
@@ -229,7 +207,7 @@ impl<'a, 'b> Iterator for ResponseStream<'a, 'b> {
         *self.n_past += 1;
 
         if let Err(e) = self.context.decode(&mut self.batch) {
-            return Some(Err(eyre!("Failed to decode token: {}", e)));
+            return Some(Err(eyre!("Decode failed: {}", e)));
         }
 
         Some(Ok(piece.to_string()))
@@ -240,10 +218,7 @@ impl<'a, 'b> Iterator for ResponseStream<'a, 'b> {
 struct Args {
     #[arg(long, default_value = "assets/qwen3vl/Qwen3VL-4B-Instruct-Q4_K_M.gguf")]
     model: String,
-    #[arg(
-        long,
-        default_value = "assets/qwen3vl/mmproj-Qwen3VL-4B-Instruct-F16.gguf"
-    )]
+    #[arg(long, default_value = "assets/qwen3vl/mmproj-Qwen3VL-4B-Instruct-F16.gguf")]
     mmproj: String,
     #[arg(long, default_value_t = 99)]
     n_gpu_layers: i32,
@@ -252,59 +227,19 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    // 1. Configure Logging to STDERR
-    // This allows us to see "Session Initialized" even if stdout is somehow compromised,
-    // and keeps our logs separate from the C++ stdout spam.
     let filter = EnvFilter::builder()
         .with_default_directive(tracing::Level::INFO.into())
         .from_env_lossy();
-
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .with(filter)
         .init();
-
     color_eyre::install()?;
 
     let args = Args::parse();
 
-    // Use stderr for our status messages so they aren't gagged if we gag stdout
-    eprintln!("Loading model... (this may take a moment)");
-
-    let backend;
-    let model;
-    let mut session;
-
-    // 2. TOTAL SILENCE BLOCK
-    {
-        // Flush everything to ensure our "Loading..." message is displayed
-        // before we cut the cord.
-        std::io::stdout().flush().ok();
-        std::io::stderr().flush().ok();
-
-        // Redirect stdout/stderr to the void.
-        // We use .unwrap() (or expect) to ensure we actually got the lock.
-        // If this fails on Windows, it often means the terminal environment
-        // doesn't support standard handle redirection properly, but it usually works.
-        let _gag_out = Gag::stdout().expect("Unable to gag stdout");
-        let _gag_err = Gag::stderr().expect("Unable to gag stderr");
-
-        backend = LlamaBackend::init().context("Failed to init backend")?;
-
-        // This stops the *polite* llama.cpp logs
-        send_logs_to_tracing(LogOptions::default().with_logs_enabled(false));
-
-        let model_params = LlamaModelParams::default()
-            .with_n_gpu_layers(args.n_gpu_layers.try_into().unwrap_or(0));
-
-        model = LlamaModel::load_from_file(&backend, &args.model, &model_params)
-            .context("Failed to load model")?;
-
-        // This is the noisy function (clip_model_loader)
-        session = MultimodalSession::new(&backend, &model, &args.mmproj, args.ctx_size)?;
-
-        // Gags drop here. Stdout/Stderr are restored.
-    }
+    let model_manager = MultimodalModel::load(&args.model, args.n_gpu_layers)?;
+    let mut session = model_manager.new_session(&args.mmproj, args.ctx_size)?;
 
     info!("--- Session Initialized ---");
 
