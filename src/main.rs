@@ -1,3 +1,5 @@
+#![allow(clippy::missing_errors_doc)]
+
 use clap::Parser;
 use color_eyre::eyre::Context;
 use color_eyre::eyre::{eyre, Result};
@@ -43,7 +45,7 @@ impl MultimodalModel {
         Ok(Self { backend, model })
     }
 
-    pub fn new_session(&self, mmproj_path: &str, ctx_size: u32) -> Result<MultimodalSession> {
+    pub fn new_session(&'_ self, mmproj_path: &str, ctx_size: u32) -> Result<MultimodalSession<'_>> {
         MultimodalSession::new(&self.backend, &self.model, mmproj_path, ctx_size)
     }
 }
@@ -52,7 +54,7 @@ pub struct MultimodalSession<'a> {
     model: &'a LlamaModel,
     context: LlamaContext<'a>,
     mtmd_ctx: MtmdContext,
-    n_past: usize,
+    n_past: i32,
     ctx_size: usize,
 }
 
@@ -125,7 +127,7 @@ impl<'a> MultimodalSession<'a> {
         let default_marker = llama_cpp_2::mtmd::mtmd_default_marker().to_string();
         let mut full_prompt = prompt.to_string();
         if !bitmaps.is_empty() && !full_prompt.contains(&default_marker) {
-            full_prompt = format!("{} {}", default_marker, full_prompt);
+            full_prompt = format!("{default_marker} {full_prompt}");
         }
 
         let messages = vec![LlamaChatMessage::new("user".to_string(), full_prompt)?];
@@ -144,12 +146,12 @@ impl<'a> MultimodalSession<'a> {
 
         self.n_past = chunks.eval_chunks(
             &self.mtmd_ctx,
-            &mut self.context,
-            self.n_past as i32,
+            &self.context,
+            self.n_past,
             0,
             4096,
             true,
-        )? as usize;
+        )?;
 
         let sampler = LlamaSampler::chain_simple([
             LlamaSampler::penalties(-1, 1.0, 0.0, 1.5),
@@ -176,11 +178,11 @@ pub struct ResponseStream<'a, 'b> {
     context: &'b mut LlamaContext<'a>,
     sampler: LlamaSampler,
     batch: LlamaBatch<'a>,
-    n_past: &'b mut usize,
+    n_past: &'b mut i32,
     is_done: bool,
 }
 
-impl<'a, 'b> Iterator for ResponseStream<'a, 'b> {
+impl Iterator for ResponseStream<'_, '_> {
     type Item = Result<String>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -200,7 +202,7 @@ impl<'a, 'b> Iterator for ResponseStream<'a, 'b> {
         };
 
         self.batch.clear();
-        if let Err(e) = self.batch.add(token, *self.n_past as i32, &[0], true) {
+        if let Err(e) = self.batch.add(token, *self.n_past, &[0], true) {
             return Some(Err(eyre!(e)));
         }
 
@@ -210,7 +212,7 @@ impl<'a, 'b> Iterator for ResponseStream<'a, 'b> {
             return Some(Err(eyre!("Decode failed: {}", e)));
         }
 
-        Some(Ok(piece.to_string()))
+        Some(Ok(piece))
     }
 }
 
