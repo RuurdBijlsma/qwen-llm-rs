@@ -1,6 +1,7 @@
 use clap::Parser;
 use color_eyre::eyre::Context;
 use color_eyre::eyre::{eyre, Result};
+use gag::Gag;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -14,20 +15,16 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::{send_logs_to_tracing, LogOptions};
 use log::info;
 use std::ffi::CString;
-use std::io::{self, Write};
+use std::io::Write; // Import Write for flush()
 use std::num::NonZeroU32;
 use std::path::Path;
-use tracing::error;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
 
-// -------------------------------------------------------------------------
-// 1. The Session Struct
-// -------------------------------------------------------------------------
 pub struct MultimodalSession<'a> {
     model: &'a LlamaModel,
     context: LlamaContext<'a>,
-    // FIX 1: MtmdContext does not take a lifetime parameter in your version
     mtmd_ctx: MtmdContext,
     n_past: usize,
     ctx_size: usize,
@@ -40,13 +37,16 @@ impl<'a> MultimodalSession<'a> {
         mmproj_path: &str,
         ctx_size: u32,
     ) -> Result<Self> {
+        // NOTE: We do NOT gag here. We rely on the caller (main) to handle global silencing.
+        // Nesting gags can cause premature stream restoration.
+
         // Create Context
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(ctx_size))
             .with_flash_attention_policy(llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED)
             .with_n_threads(8)
-            .with_n_batch(2048)
-            .with_n_ubatch(512);
+            .with_n_batch(4096)
+            .with_n_ubatch(4096);
 
         let context = model
             .new_context(backend, ctx_params)
@@ -55,13 +55,12 @@ impl<'a> MultimodalSession<'a> {
         // Init MTMD Context
         let mtmd_params = MtmdContextParams {
             use_gpu: true,
-            print_timings: true,
+            print_timings: false,
             n_threads: 8,
             media_marker: CString::new(llama_cpp_2::mtmd::mtmd_default_marker().to_string())?,
         };
 
-        // Even though MtmdContext doesn't expose a lifetime in its struct def,
-        // it internally handles the pointer to the model.
+        // This function call is the source of the "clip_model_loader" spam
         let mtmd_ctx = MtmdContext::init_from_file(mmproj_path, model, &mtmd_params)
             .context("Failed to initialize MTMD context")?;
 
@@ -72,6 +71,12 @@ impl<'a> MultimodalSession<'a> {
             n_past: 0,
             ctx_size: ctx_size as usize,
         })
+    }
+
+    /// Resets the context (clears KV cache).
+    pub fn reset(&mut self) {
+        self.context.clear_kv_cache();
+        self.n_past = 0;
     }
 
     pub fn chat<P: AsRef<Path>>(&mut self, prompt: &str, image_paths: &[P]) -> Result<String> {
@@ -98,7 +103,21 @@ impl<'a> MultimodalSession<'a> {
         prompt: &str,
         image_paths: &[P],
     ) -> Result<ResponseStream<'a, '_>> {
-        // 1. Load all images
+        // Local silence for the chat processing loop (image encoding logs)
+        let _gag_out;
+        let _gag_err;
+
+        {
+            // Flush before gagging to prevent losing pending Rust logs
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+
+            // Gag both. Using .ok() here is safer for the loop, but in main we strictly check.
+            _gag_out = Gag::stdout().ok();
+            _gag_err = Gag::stderr().ok();
+        }
+
+        // 1. Load Images
         let mut bitmaps = Vec::new();
         let loaded_bitmaps: Vec<MtmdBitmap> = image_paths
             .iter()
@@ -111,29 +130,19 @@ impl<'a> MultimodalSession<'a> {
                     .context(format!("Failed to load image: {}", path_str))
             })
             .collect::<Result<Vec<_>>>()?;
-
         bitmaps.extend(loaded_bitmaps.iter());
 
-        // 2. Prepare Prompt & Apply Chat Template
         let default_marker = llama_cpp_2::mtmd::mtmd_default_marker().to_string();
         let mut full_prompt = prompt.to_string();
-
         if !bitmaps.is_empty() && !full_prompt.contains(&default_marker) {
             full_prompt = format!("{} {}", default_marker, full_prompt);
         }
-
         let messages = vec![LlamaChatMessage::new("user".to_string(), full_prompt)?];
+        let chat_template = self.model.chat_template(None)?;
+        let formatted_prompt =
+            self.model
+                .apply_chat_template(&chat_template, &messages, true)?;
 
-        let chat_template = self
-            .model
-            .chat_template(None)
-            .context("Failed to get chat template")?;
-        let formatted_prompt = self
-            .model
-            .apply_chat_template(&chat_template, &messages, true)
-            .context("Failed to apply chat template")?;
-
-        // 3. Tokenize & Evaluate Multimodal Input
         let input_text = MtmdInputText {
             text: formatted_prompt,
             add_special: true,
@@ -143,7 +152,7 @@ impl<'a> MultimodalSession<'a> {
         let chunks = self
             .mtmd_ctx
             .tokenize(input_text, &bitmaps)
-            .context("Failed to tokenize multimodal input")?;
+            .context("Failed to tokenize")?;
 
         self.n_past = chunks
             .eval_chunks(
@@ -151,12 +160,16 @@ impl<'a> MultimodalSession<'a> {
                 &mut self.context,
                 self.n_past as i32,
                 0,
-                2048,
+                4096,
                 true,
             )
-            .context("Failed to evaluate chunks")? as usize;
+            .context("Failed to evaluate")? as usize;
 
-        // 4. Initialize Sampler
+        // Gags will drop automatically when `_gag_out`/`_gag_err` go out of scope at end of function
+        // Wait, we need to return the stream. We drop them *now* before returning.
+        drop(_gag_out);
+        drop(_gag_err);
+
         let sampler = LlamaSampler::chain_simple([
             LlamaSampler::penalties(-1, 1.0, 0.0, 1.5),
             LlamaSampler::top_p(0.8, 1),
@@ -178,9 +191,6 @@ impl<'a> MultimodalSession<'a> {
     }
 }
 
-// -------------------------------------------------------------------------
-// 2. The Iterator (Stream)
-// -------------------------------------------------------------------------
 pub struct ResponseStream<'a, 'b> {
     model: &'a LlamaModel,
     context: &'b mut LlamaContext<'a>,
@@ -226,10 +236,6 @@ impl<'a, 'b> Iterator for ResponseStream<'a, 'b> {
     }
 }
 
-// -------------------------------------------------------------------------
-// 3. Main
-// -------------------------------------------------------------------------
-
 #[derive(Parser, Debug)]
 struct Args {
     #[arg(long, default_value = "assets/qwen3vl/Qwen3VL-4B-Instruct-Q4_K_M.gguf")]
@@ -246,36 +252,81 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    // 1. Configure Logging to STDERR
+    // This allows us to see "Session Initialized" even if stdout is somehow compromised,
+    // and keeps our logs separate from the C++ stdout spam.
+    let filter = EnvFilter::builder()
+        .with_default_directive(tracing::Level::INFO.into())
+        .from_env_lossy();
+
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(filter)
         .init();
+
     color_eyre::install()?;
 
     let args = Args::parse();
 
-    // 1. Init Backend and Model
-    let backend = LlamaBackend::init().context("Failed to init backend")?;
-    send_logs_to_tracing(LogOptions::default().with_logs_enabled(false));
-    let model_params =
-        LlamaModelParams::default().with_n_gpu_layers(args.n_gpu_layers.try_into().unwrap_or(0));
-    let model = LlamaModel::load_from_file(&backend, &args.model, &model_params)
-        .context("Failed to load model")?;
+    // Use stderr for our status messages so they aren't gagged if we gag stdout
+    eprintln!("Loading model... (this may take a moment)");
 
-    // 2. Initialize Session
-    let mut session = MultimodalSession::new(&backend, &model, &args.mmproj, args.ctx_size)?;
+    let backend;
+    let model;
+    let mut session;
 
-    println!("--- Session Initialized ---");
+    // 2. TOTAL SILENCE BLOCK
+    {
+        // Flush everything to ensure our "Loading..." message is displayed
+        // before we cut the cord.
+        std::io::stdout().flush().ok();
+        std::io::stderr().flush().ok();
+
+        // Redirect stdout/stderr to the void.
+        // We use .unwrap() (or expect) to ensure we actually got the lock.
+        // If this fails on Windows, it often means the terminal environment
+        // doesn't support standard handle redirection properly, but it usually works.
+        let _gag_out = Gag::stdout().expect("Unable to gag stdout");
+        let _gag_err = Gag::stderr().expect("Unable to gag stderr");
+
+        backend = LlamaBackend::init().context("Failed to init backend")?;
+
+        // This stops the *polite* llama.cpp logs
+        send_logs_to_tracing(LogOptions::default().with_logs_enabled(false));
+
+        let model_params = LlamaModelParams::default()
+            .with_n_gpu_layers(args.n_gpu_layers.try_into().unwrap_or(0));
+
+        model = LlamaModel::load_from_file(&backend, &args.model, &model_params)
+            .context("Failed to load model")?;
+
+        // This is the noisy function (clip_model_loader)
+        session = MultimodalSession::new(&backend, &model, &args.mmproj, args.ctx_size)?;
+
+        // Gags drop here. Stdout/Stderr are restored.
+    }
+
+    info!("--- Session Initialized ---");
 
     let img_hike = Path::new("assets/img/hike.png");
     let img_farm = Path::new("assets/img/farm.png");
     let img_torus = Path::new("assets/img/torus.png");
     let prompt = "Caption this image in one paragraph. Respond with the caption only.";
 
-    info!("{}", session.chat(prompt, &[img_hike])?);
-    info!("{}", session.chat(prompt, &[img_farm])?);
-    info!("{}", session.chat(prompt, &[img_torus])?);
+    info!("Hike: {}", session.chat(prompt, &[img_hike])?);
 
-    info!("{}", session.chat("Where might this be?", &[img_hike])?);
+    session.reset();
+    info!("Farm: {}", session.chat(prompt, &[img_farm])?);
+
+    session.reset();
+    info!("Torus: {}", session.chat(prompt, &[img_torus])?);
+
+    session.reset();
+    info!("Hike 2: {}", session.chat(prompt, &[img_hike])?);
+    info!(
+        "Follow up: {}",
+        session.chat("Where might this be?", &[] as &[&str])?
+    );
 
     Ok(())
 }
