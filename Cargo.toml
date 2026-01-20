@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-llama-cpp-2 = { path = "../llama-cpp-rs/llama-cpp-2", features = ["mtmd", "cuda"] }
-llama-cpp-sys-2 = { path = "../llama-cpp-rs/llama-cpp-sys-2" }
 tracing = "0.1.44"
 color-eyre = "0.6.5"
-tracing-subscriber = {version = "0.3.22", features = ["env-filter"]}
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+llama-cpp-2 = { git = "https://github.com/utilityai/llama-cpp-rs", features = ["mtmd", "cuda"] }
+llama-cpp-sys-2 = { git = "https://github.com/utilityai/llama-cpp-rs" }
 gag = "1.0.0"
