@@ -1,0 +1,8 @@
+https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct-GGUF/tree/main
+
+download the following:
+
+* mmproj-Qwen3VL-4B-Instruct-F16.gguf
+* Qwen3VL-4B-Instruct-Q4_K_M.gguf
+
+Place them in this folder.
