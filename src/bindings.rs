@@ -14,6 +14,7 @@ use std::io;
 use std::io::Write;
 use std::num::NonZeroU32;
 use std::path::Path;
+use std::time::Instant;
 use tracing::info;
 
 // todo:
@@ -191,8 +192,15 @@ pub fn run() -> Result<()> {
     let img_torus = Path::new("assets/img/torus.png");
     let prompt = "Caption this image in one paragraph. Respond with the caption only.";
 
+    let now = Instant::now();
+
+    // Warmup
     info!("Island: {}", session.chat(prompt, &[img_island])?);
     session.reset();
+
+    let now2 = Instant::now();
+
+    // Actual requests
     info!("Farm: {}", session.chat(prompt, &[img_farm])?);
     session.reset();
     info!("Torus: {}", session.chat(prompt, &[img_torus])?);
@@ -200,17 +208,11 @@ pub fn run() -> Result<()> {
     info!("Island again: {}", session.chat(prompt, &[img_island])?);
     info!(
         "Follow up: {}",
-        session.chat("Where might this be?", &[] as &[&str])?
+        session.chat("Where might this be?", &[] as &[&Path])?
     );
 
-    println!();
-    for token in session.stream_chat("Describe the scene.", &[] as &[&str])? {
-        print!("{}", token?);
-        io::stdout().flush()?;
-    }
-    println!();
-    
-    // todo: compare 2 images
+    info!("Total time for [bindings]: {:?}", now.elapsed());
+    info!("Total time for [bindings] (excluding warmup): {:?}", now2.elapsed());
 
     Ok(())
 }
