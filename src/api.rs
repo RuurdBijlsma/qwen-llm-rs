@@ -78,6 +78,9 @@ impl ChatSession {
 }
 
 pub async fn run() -> Result<()> {
+    // todo: add model load/unload functions to ChatSession
+    // https://huggingface.co/blog/ggml-org/model-management-in-llamacpp#manually-load-a-model
+
     let mut session = ChatSession::new("http://localhost:8080");
 
     let img_island = Path::new("assets/img/island.png");
