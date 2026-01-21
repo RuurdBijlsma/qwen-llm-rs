@@ -1,6 +1,5 @@
 #![allow(clippy::missing_errors_doc)]
 
-use tracing::info;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter};

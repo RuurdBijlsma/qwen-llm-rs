@@ -1,8 +1,8 @@
 #![allow(clippy::missing_errors_doc)]
 
-use base64::{Engine as _, engine::general_purpose};
+use base64::{engine::general_purpose, Engine as _};
 use color_eyre::Result;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::path::Path;
 use std::time::Instant;
 use tracing::{error, info};
@@ -31,9 +31,11 @@ impl ChatSession {
         let mut content = vec![json!({ "type": "text", "text": prompt })];
         for path in image_paths {
             let bytes = std::fs::read(path)?;
-            let b64 = general_purpose::STANDARD.encode(bytes);
-            // todo: detect image format
-            let data_url = format!("data:image/png;base64,{b64}");
+            let mime_type = infer::get(&bytes)
+                .map(|kind| kind.mime_type())
+                .unwrap_or("image/jpeg");
+            let b64 = general_purpose::STANDARD.encode(&bytes);
+            let data_url = format!("data:{mime_type};base64,{b64}");
             content.push(json!({
                 "type": "image_url",
                 "image_url": { "url": data_url }
@@ -57,7 +59,10 @@ impl ChatSession {
             let status = response.status();
             let error_text = response.text().await?;
             error!("API Error ({}): {}", status, error_text);
-            return Err(color_eyre::eyre::eyre!("Llama-server returned error: {}", status));
+            return Err(color_eyre::eyre::eyre!(
+                "Llama-server returned error: {}",
+                status
+            ));
         }
         let res_body: Value = response.json().await?;
         let assistant_text = res_body["choices"][0]["message"]["content"]
@@ -68,7 +73,6 @@ impl ChatSession {
             "role": "assistant",
             "content": assistant_text
         }));
-
         Ok(assistant_text)
     }
 }
@@ -94,14 +98,28 @@ pub async fn run() -> Result<()> {
     session.reset();
     info!("Torus: {}", session.chat(prompt, &[img_torus]).await?);
     session.reset();
-    info!("Island again: {}", session.chat(prompt, &[img_island]).await?);
+    info!(
+        "Island again: {}",
+        session.chat(prompt, &[img_island]).await?
+    );
     info!(
         "Follow up: {}",
-        session.chat("Where might this be?", &[] as &[&Path]).await?
+        session
+            .chat("Where might this be?", &[] as &[&Path])
+            .await?
+    );
+    info!(
+        "Similarities: {}",
+        session
+            .chat("What are the similarities with this picture?", &[img_torus])
+            .await?
     );
 
     info!("Total time for [API]: {:?}", now.elapsed());
-    info!("Total time for [API] (excluding warmup): {:?}", now2.elapsed());
+    info!(
+        "Total time for [API] (excluding warmup): {:?}",
+        now2.elapsed()
+    );
 
     Ok(())
 }

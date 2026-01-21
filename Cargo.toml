@@ -16,3 +16,4 @@ tokio = { version = "1.49.0", features = ["full"] }
 reqwest = { version = "0.13.1", features = ["json"] }
 serde_json = "1.0.149"
 base64 = "0.22.1"
+infer = "0.19.0"

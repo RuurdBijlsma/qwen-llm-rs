@@ -10,8 +10,6 @@ use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputTex
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::{mtmd, send_logs_to_tracing, LogOptions};
 use std::ffi::CString;
-use std::io;
-use std::io::Write;
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::time::Instant;
@@ -24,7 +22,7 @@ const SHOW_LLAMA_LOGS: bool = false;
 const MODEL_PATH: &str = "assets/qwen3vl/Qwen3VL-4B-Instruct-Q4_K_M.gguf";
 const MMPROJ_PATH: &str = "assets/qwen3vl/mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf";
 const GPU_LAYERS: u32 = 99;
-const CTX_SIZE: u32 = 2048;
+const CTX_SIZE: u32 = 4096;
 
 pub struct MultimodalModel {
     backend: LlamaBackend,
@@ -209,6 +207,11 @@ pub fn run() -> Result<()> {
     info!(
         "Follow up: {}",
         session.chat("Where might this be?", &[] as &[&Path])?
+    );
+    info!(
+        "Similarities: {}",
+        session
+            .chat("What are the similarities with this picture?", &[img_torus])?
     );
 
     info!("Total time for [bindings]: {:?}", now.elapsed());
