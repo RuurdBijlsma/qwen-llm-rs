@@ -1,6 +1,7 @@
 use async_stream::try_stream;
 use base64::{engine::general_purpose, Engine as _};
 use bon::bon;
+use color_eyre::Result;
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -9,8 +10,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
 use thiserror::Error;
+use tokio::fs;
 use tracing::info;
-use color_eyre::Result;
 
 #[derive(Error, Debug)]
 pub enum LlamaError {
@@ -211,7 +212,8 @@ impl ChatSession {
         #[builder(start_fn)] prompt: &str,
         images: Option<&[&Path]>,
     ) -> LlamaResult<String> {
-        self.prepare_user_message(prompt, images.unwrap_or_default())?;
+        self.prepare_user_message(prompt, images.unwrap_or_default())
+            .await?;
         let response = self
             .client
             .full_request(self.model.clone(), self.messages.clone())
@@ -231,7 +233,8 @@ impl ChatSession {
         #[builder(start_fn)] prompt: &str,
         images: Option<&[&Path]>,
     ) -> LlamaResult<ChatResponseStream<'a>> {
-        self.prepare_user_message(prompt, images.unwrap_or_default())?;
+        self.prepare_user_message(prompt, images.unwrap_or_default())
+            .await?;
         let inner = self
             .client
             .stream_request(self.model.clone(), self.messages.clone())
@@ -243,12 +246,16 @@ impl ChatSession {
         })
     }
 
-    fn prepare_user_message(&mut self, prompt: &str, images: &[impl AsRef<Path>]) -> LlamaResult<()> {
+    async fn prepare_user_message(
+        &mut self,
+        prompt: &str,
+        images: &[impl AsRef<Path> + Sync],
+    ) -> LlamaResult<()> {
         let mut parts = vec![MessagePart::Text {
             text: prompt.to_string(),
         }];
         for path in images {
-            let bytes = std::fs::read(path)?;
+            let bytes = fs::read(path).await?;
             let mime_type = infer::get(&bytes).map_or("image/jpeg", |kind| kind.mime_type());
             let b64 = general_purpose::STANDARD.encode(&bytes);
             let data_url = format!("data:{mime_type};base64,{b64}");
