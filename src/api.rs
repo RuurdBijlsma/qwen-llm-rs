@@ -1,11 +1,13 @@
-use std::io::Write;
 use async_stream::try_stream;
 use base64::{engine::general_purpose, Engine as _};
+use bon::bon;
 use color_eyre::Result;
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::Path;
 use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Instant;
 use tracing::info;
 
@@ -42,17 +44,62 @@ pub enum ChatEvent {
     Reasoning(String),
 }
 
+pub struct ChatResponseStream<'a> {
+    inner: Pin<Box<dyn Stream<Item = Result<ChatEvent>> + Send>>,
+    session: &'a mut ChatSession,
+    accumulated_content: String,
+}
+
+impl Stream for ChatResponseStream<'_> {
+    type Item = Result<ChatEvent>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let result = self.inner.poll_next_unpin(cx);
+
+        match &result {
+            Poll::Ready(Some(Ok(ChatEvent::Content(c)))) => {
+                self.accumulated_content.push_str(c);
+            }
+            Poll::Ready(None) => {
+                // The stream finished successfully, push the full message to history
+                let content = std::mem::take(&mut self.accumulated_content);
+                if !content.is_empty() {
+                    self.session.push_text("assistant", content);
+                }
+            }
+            _ => {}
+        }
+        result
+    }
+}
+
 #[derive(Clone)]
 pub struct LlamaClient {
     http: reqwest::Client,
     base_url: String,
+    temperature: f32,
+    top_p: f32,
+    repetition_penalty: f32,
+    presence_penalty: f32,
 }
 
+#[bon]
 impl LlamaClient {
-    pub fn new(base_url: &str) -> Self {
+    #[builder(start_fn = with_base_url)]
+    pub fn new(
+        #[builder(start_fn)] base_url: &str,
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+        repetition_penalty: Option<f32>,
+        presence_penalty: Option<f32>,
+    ) -> Self {
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.to_string(),
+            temperature: temperature.unwrap_or(0.7),
+            top_p: top_p.unwrap_or(0.8),
+            repetition_penalty: repetition_penalty.unwrap_or(1.0),
+            presence_penalty: presence_penalty.unwrap_or(1.5),
         }
     }
 
@@ -64,18 +111,20 @@ impl LlamaClient {
         let request = ChatRequest {
             model,
             messages,
-            temperature: 0.7,
             stream: false,
-            reasoning_format: "deepseek".to_string(),
+            top_p: self.top_p,
+            temperature: self.temperature,
+            repetition_penalty: self.repetition_penalty,
+            presence_penalty: self.presence_penalty,
         };
 
         let url = format!("{}/v1/chat/completions", self.base_url);
         let response = self.http.post(url).json(&request).send().await?;
 
         if !response.status().is_success() {
-            let status =response.status();
+            let status = response.status();
             let err = response.text().await?;
-            return Err(color_eyre::eyre::eyre!("API Error ({}): {}",status , err));
+            return Err(color_eyre::eyre::eyre!("API Error ({}): {}", status, err));
         }
 
         Ok(response.json().await?)
@@ -89,9 +138,11 @@ impl LlamaClient {
         let request = ChatRequest {
             model,
             messages,
-            temperature: 0.7,
             stream: true,
-            reasoning_format: "deepseek".to_string(),
+            top_p: self.top_p,
+            temperature: self.temperature,
+            repetition_penalty: self.repetition_penalty,
+            presence_penalty: self.presence_penalty,
         };
 
         let url = format!("{}/v1/chat/completions", self.base_url);
@@ -125,44 +176,67 @@ impl LlamaClient {
 
 pub struct ChatSession {
     client: LlamaClient,
-    pub model: String,
-    pub messages: Vec<Message>,
+    model: String,
+    messages: Vec<Message>,
 }
 
+#[bon]
 impl ChatSession {
-    pub fn new(base_url: &str, model: &str) -> Self {
+    #[builder(start_fn = with_client)]
+    pub fn new(#[builder(start_fn)] client: LlamaClient, model: Option<String>) -> Self {
         Self {
-            client: LlamaClient::new(base_url),
-            model: model.to_string(),
+            client,
+            model: model.unwrap_or_default(),
             messages: Vec::new(),
         }
     }
 
-    pub async fn chat<P: AsRef<Path> + Sync>(
+    #[builder]
+    pub async fn chat(
         &mut self,
-        prompt: &str,
-        images: &[P],
+        #[builder(start_fn)] prompt: &str,
+        images: Option<&[&Path]>,
     ) -> Result<String> {
-        self.prepare_user_message(prompt, images)?;
-        let response = self.client.full_request(self.model.clone(), self.messages.clone()).await?;
-        let choice = response.choices.first()
-            .ok_or_else(|| color_eyre::eyre::eyre!("No choices in response"))?;
-        let content = choice.message.content.clone().unwrap_or_default();
+        self.prepare_user_message(prompt, images.unwrap_or_default())?;
+        let response = self
+            .client
+            .full_request(self.model.clone(), self.messages.clone())
+            .await?;
+
+        let content = response
+            .choices
+            .first()
+            .and_then(|c| c.message.content.clone())
+            .unwrap_or_default();
+
         self.push_text("assistant", content.clone());
         Ok(content)
     }
 
-    pub async fn chat_stream<P: AsRef<Path> + Sync>(
-        &mut self,
-        prompt: &str,
-        image_paths: &[P],
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatEvent>> + Send>>> {
-        self.prepare_user_message(prompt, image_paths)?;
-        self.client.stream_request(self.model.clone(), self.messages.clone()).await
+    #[builder]
+    pub async fn chat_stream<'a>(
+        &'a mut self,
+        #[builder(start_fn)] prompt: &str,
+        images: Option<&[&Path]>,
+    ) -> Result<ChatResponseStream<'a>> {
+        self.prepare_user_message(prompt, images.unwrap_or_default())?;
+
+        let inner = self
+            .client
+            .stream_request(self.model.clone(), self.messages.clone())
+            .await?;
+
+        Ok(ChatResponseStream {
+            inner,
+            session: self,
+            accumulated_content: String::new(),
+        })
     }
 
-    fn prepare_user_message<P: AsRef<Path> + Sync>(&mut self, prompt: &str, images: &[P]) -> Result<()> {
-        let mut parts = vec![MessagePart::Text { text: prompt.to_string() }];
+    fn prepare_user_message(&mut self, prompt: &str, images: &[impl AsRef<Path>]) -> Result<()> {
+        let mut parts = vec![MessagePart::Text {
+            text: prompt.to_string(),
+        }];
         for path in images {
             let bytes = std::fs::read(path)?;
             let mime_type = infer::get(&bytes).map_or("image/jpeg", |kind| kind.mime_type());
@@ -186,25 +260,35 @@ impl ChatSession {
         });
     }
 
-    pub fn reset(&mut self) { self.messages.clear(); }
-    pub fn set_model(&mut self, model: &str) { self.model = model.to_string(); }
+    pub fn reset(&mut self) {
+        self.messages.clear();
+    }
 }
 
 #[derive(Serialize)]
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
-    temperature: f32,
     stream: bool,
-    reasoning_format: String,
+    temperature: f32,
+    top_p: f32,
+    repetition_penalty: f32,
+    presence_penalty: f32,
 }
 
 #[derive(Deserialize)]
-struct ChatChunk { choices: Vec<ChunkChoice> }
+struct ChatChunk {
+    choices: Vec<ChunkChoice>,
+}
 #[derive(Deserialize)]
-struct ChunkChoice { delta: ChunkDelta }
+struct ChunkChoice {
+    delta: ChunkDelta,
+}
 #[derive(Deserialize)]
-struct ChunkDelta { content: Option<String>, reasoning_content: Option<String> }
+struct ChunkDelta {
+    content: Option<String>,
+    reasoning_content: Option<String>,
+}
 
 #[derive(Deserialize)]
 pub struct ChatFullResponse {
@@ -217,11 +301,11 @@ pub struct FullChoice {
 #[derive(Deserialize)]
 pub struct FullMessage {
     pub content: Option<String>,
-    pub reasoning_content: Option<String>,
 }
 
 pub async fn run() -> Result<()> {
-    let mut session = ChatSession::new("http://localhost:8080", "");
+    let client = LlamaClient::with_base_url("http://localhost:8080").build();
+    let mut session = ChatSession::with_client(client).build();
 
     let img_island = Path::new("assets/img/island.png");
     let img_farm = Path::new("assets/img/farm.png");
@@ -231,32 +315,65 @@ pub async fn run() -> Result<()> {
     let now = Instant::now();
 
     // Warmup
-    info!("Island: {}", session.chat(prompt, &[img_island]).await?);
+    info!(
+        "Island: {}",
+        session.chat(prompt).images(&[img_island]).call().await?
+    );
     session.reset();
-
     let now2 = Instant::now();
-    info!("Farm: {}", session.chat(prompt, &[img_farm]).await?);
+    info!(
+        "Farm: {}",
+        session.chat(prompt).images(&[img_farm]).call().await?
+    );
     session.reset();
-    info!("Torus: {}", session.chat(prompt, &[img_torus]).await?);
+    info!(
+        "Torus: {}",
+        session.chat(prompt).images(&[img_torus]).call().await?
+    );
     session.reset();
-    info!("Island again: {}", session.chat(prompt, &[img_island]).await?);
-    info!("Follow up: {}", session.chat("Where might this be?", &[] as &[&Path]).await?);
-    info!("Similarities: {}", session.chat("What are the similarities with this picture?", &[img_torus]).await?);
+    info!(
+        "Island again: {}",
+        session.chat(prompt).images(&[img_island]).call().await?
+    );
+    // Follow up (chat history is remembered)
+    info!(
+        "Follow up: {}",
+        session.chat("Where might this be?").call().await?
+    );
+    // Compare two images
+    info!(
+        "Similarities: {}",
+        session
+            .chat("What are the similarities with this picture?")
+            .images(&[img_torus])
+            .call()
+            .await?
+    );
 
     info!("Total time for [API]: {:?}", now.elapsed());
-    info!("Total time for [API] (excluding warmup): {:?}", now2.elapsed());
+    info!(
+        "Total time for [API] (excluding warmup): {:?}",
+        now2.elapsed()
+    );
 
-    let mut stream = session.chat_stream("How do I install minecraft?", &[] as &[&Path]).await?;
-    let mut full_response = String::new();
+    // Stream chat example
+    let mut stream = session
+        .chat_stream("how do i get minecraft mods like this?")
+        .call()
+        .await?;
     while let Some(event) = stream.next().await {
         if let ChatEvent::Content(c) = event? {
             print!("{c}");
             std::io::stdout().flush()?;
-            full_response.push_str(&c);
         }
     }
     println!();
-    session.push_text("assistant", full_response);
+
+    // Follow up on stream chat.
+    info!(
+        "Followup 3: {}",
+        session.chat("can you expand on that?").call().await?
+    );
 
     Ok(())
 }
