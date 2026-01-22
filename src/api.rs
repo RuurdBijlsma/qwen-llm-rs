@@ -2,7 +2,7 @@ use async_stream::try_stream;
 use base64::{engine::general_purpose, Engine as _};
 use bon::bon;
 use color_eyre::Result;
-use futures_util::{Stream, StreamExt};
+use futures_util::{Stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::Path;
@@ -11,6 +11,8 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 use thiserror::Error;
 use tokio::fs;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio_util::io::StreamReader;
 use tracing::info;
 
 #[derive(Error, Debug)]
@@ -167,25 +169,28 @@ impl LlamaClient {
                 body: response.text().await.unwrap_or_default(),
             });
         }
-        let mut stream_bytes = response.bytes_stream();
+        let stream_bytes = response.bytes_stream().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, e)
+        });
+        let reader = StreamReader::new(stream_bytes);
+        let mut lines = BufReader::new(reader).lines();
         Ok(Box::pin(try_stream! {
-            while let Some(item) = stream_bytes.next().await {
-                let chunk_bytes = item.map_err(LlamaError::Http)?;
-                let text = String::from_utf8_lossy(&chunk_bytes);
-
-                for line in text.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line == "data: [DONE]" { continue; }
-                    if let Some(data) = line.strip_prefix("data: ") {
-                        let chunk = serde_json::from_str::<ChatChunk>(data).map_err(LlamaError::Json)?;
-                        if let Some(choice) = chunk.choices.first() {
-                            if let Some(r) = &choice.delta.reasoning_content { yield ChatEvent::Reasoning(r.clone()); }
-                            if let Some(c) = &choice.delta.content { yield ChatEvent::Content(c.clone()); }
-                        }
+        while let Some(line) = lines.next_line().await.map_err(LlamaError::Io)? {
+            let line = line.trim();
+            if line.is_empty() || line == "data: [DONE]" { continue; }
+            if let Some(data) = line.strip_prefix("data: ") {
+                let chunk = serde_json::from_str::<ChatChunk>(data).map_err(LlamaError::Json)?;
+                if let Some(choice) = chunk.choices.first() {
+                    if let Some(r) = &choice.delta.reasoning_content {
+                        yield ChatEvent::Reasoning(r.clone());
+                    }
+                    if let Some(c) = &choice.delta.content {
+                        yield ChatEvent::Content(c.clone());
                     }
                 }
             }
-        }))
+        }
+    }))
     }
 }
 
