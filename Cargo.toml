@@ -21,3 +21,4 @@ futures-util = "0.3.31"
 serde = { version = "1.0.228", features = ["derive"] }
 async-stream = "0.3.6"
 bon = "3.8.2"
+thiserror = "2.0.18"
