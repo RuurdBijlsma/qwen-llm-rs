@@ -1,5 +1,3 @@
-#![allow(clippy::missing_errors_doc)]
-
 use base64::{engine::general_purpose, Engine as _};
 use color_eyre::Result;
 use serde_json::{json, Value};
@@ -11,15 +9,17 @@ pub struct ChatSession {
     base_url: String,
     client: reqwest::Client,
     messages: Vec<Value>,
+    pub active_model: String,
 }
 
 impl ChatSession {
     #[must_use]
-    pub fn new(base_url: &str) -> Self {
+    pub fn new(base_url: &str, model: &str) -> Self {
         Self {
             base_url: base_url.to_string(),
             client: reqwest::Client::new(),
             messages: Vec::new(),
+            active_model: model.to_owned(),
         }
     }
 
@@ -27,13 +27,57 @@ impl ChatSession {
         self.messages.clear();
     }
 
-    pub async fn chat(&mut self, prompt: &str, image_paths: &[impl AsRef<Path>]) -> Result<String> {
+    pub async fn list_models(&self) -> Result<Vec<String>> {
+        let url = format!("{}/models", self.base_url);
+        let res_body: Value = self.client.get(url).send().await?.json().await?;
+        let names = res_body["data"]
+            .as_array()
+            .ok_or_else(|| color_eyre::eyre::eyre!("Missing 'data' array in response"))?
+            .iter()
+            .filter_map(|m| m["id"].as_str())
+            .map(String::from)
+            .collect();
+
+        Ok(names)
+    }
+
+    pub async fn load_model(&self, model_name: &str) -> Result<()> {
+        let url = format!("{}/models/load", self.base_url);
+        let payload = json!({ "model": model_name });
+        let response = self.client.post(url).json(&payload).send().await?;
+
+        if response.status().is_success() {
+            info!("Model {} loaded successfully", model_name);
+            Ok(())
+        } else {
+            let err = response.text().await?;
+            Err(color_eyre::eyre::eyre!("Failed to load model: {}", err))
+        }
+    }
+
+    pub async fn unload_model(&self, model_name: &str) -> Result<()> {
+        let url = format!("{}/models/unload", self.base_url);
+        let payload = json!({ "model": model_name });
+        let response = self.client.post(url).json(&payload).send().await?;
+
+        if response.status().is_success() {
+            info!("Model {} unloaded successfully", model_name);
+            Ok(())
+        } else {
+            let err = response.text().await?;
+            Err(color_eyre::eyre::eyre!("Failed to unload model: {}", err))
+        }
+    }
+
+    pub async fn chat<P: AsRef<Path> + Sync>(
+        &mut self,
+        prompt: &str,
+        image_paths: &[P],
+    ) -> Result<String> {
         let mut content = vec![json!({ "type": "text", "text": prompt })];
         for path in image_paths {
             let bytes = std::fs::read(path)?;
-            let mime_type = infer::get(&bytes)
-                .map(|kind| kind.mime_type())
-                .unwrap_or("image/jpeg");
+            let mime_type = infer::get(&bytes).map_or("image/jpeg", |kind| kind.mime_type());
             let b64 = general_purpose::STANDARD.encode(&bytes);
             let data_url = format!("data:{mime_type};base64,{b64}");
             content.push(json!({
@@ -45,13 +89,15 @@ impl ChatSession {
             "role": "user",
             "content": content
         }));
+
         let payload = json!({
-            "model": "",
+            "model": self.active_model,
             "messages": self.messages,
             "temperature": 0.7,
             "top_p": 0.8,
             "max_tokens": 1024
         });
+
         let url = format!("{}/v1/chat/completions", self.base_url);
         let response = self.client.post(url).json(&payload).send().await?;
 
@@ -78,10 +124,7 @@ impl ChatSession {
 }
 
 pub async fn run() -> Result<()> {
-    // todo: add model load/unload functions to ChatSession
-    // https://huggingface.co/blog/ggml-org/model-management-in-llamacpp#manually-load-a-model
-
-    let mut session = ChatSession::new("http://localhost:8080");
+    let mut session = ChatSession::new("http://localhost:8080", "");
 
     let img_island = Path::new("assets/img/island.png");
     let img_farm = Path::new("assets/img/farm.png");
